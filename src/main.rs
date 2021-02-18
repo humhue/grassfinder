@@ -4,36 +4,38 @@ use std::error::Error;
 use std::ops::*;
 use std::process;
 
-const PATH: &'static str = "positions.txt";
+const PATH: &'static str = "offsets.txt";
 
 fn main() {
 	let spiral = ChebyshevIterator::new(0, 0, 2048);
 	let rows = load_grass_positions().unwrap();
+    let recorigin = Position::new(-46, 66, 3);
 
 	for (x, z) in spiral {
-		for y in 63..129 {
-			let mut matches = 0;
-			let origin = Position { x, y, z };
+		for y in 62..80 {
+			let mut delta = 0;
+			let testpos = Position { x, y, z };
 
 			for (pos, off) in rows.iter() {
-				let pos_abs = origin + *pos;
+				let pos_abs = testpos + *pos - recorigin;
 				let temp = grass_offset_from_pos(pos_abs);
 				let mut is_match = "";
 
-				if *off == grass_offset_from_pos(pos_abs) {
-					matches += 1;
-					is_match = "MATCH";
-				}
+//				if (*off - grass_offset_from_pos(pos_abs)).abs() < 2 {
+//					matches += 1;
+//					is_match = "MATCH";
+//				}
+                delta += (*off - grass_offset_from_pos(pos_abs)).abs() as i32;
 
 //				println!();
 //				println!("{:>8}{:>8}{:>8}", pos_abs.x, pos_abs.y, pos_abs.z);
 //				println!("{:>8}{:>8}{:>8}{:>8}{:>8}{:>8} {}", off.x, off.y, off.z, temp.x, temp.y, temp.z, is_match);
 			}
 
-			if matches > 2 {
+			if delta < 10 {
 				println!(
-					"{:>8}{:>8}{:>8} has {}/{} matches",
-					x, y, z, matches, rows.len()
+					"{:>8}{:>8}{:>8} has delta of {}",
+					x, y, z, delta
 				);
 			}
 		}
@@ -53,15 +55,15 @@ fn grass_offset(x: i32, y: i32, z: i32) -> Offset {
 	let mut seed = (x * X_MULT) as i64 ^ (z * Z_MULT) as i64 ^ y as i64;
 	seed = seed * seed * LCG_MULT + seed * LCG_ADDEND;
 	Offset {
-		x: (seed >> 16 & 15) as u8,
-		y: (seed >> 20 & 15) as u8,
-		z: (seed >> 24 & 15) as u8,
+		x: (seed >> 16 & 15) as i8,
+		y: (seed >> 20 & 15) as i8,
+		z: (seed >> 24 & 15) as i8,
 	}
 }
 
 // returns a tuple of the input integer offsets converted to
 // actual position offsets (1.0 is equal to 1 block)
-fn off_itof_xyz(x: u8, y: u8, z: u8) -> (f64, f64, f64) {
+fn off_itof_xyz(x: i8, y: i8, z: i8) -> (f64, f64, f64) {
 	(
 		map(x as f64, 0.0, 15.0, -0.25, 0.25),
 		map(y as f64, 0.0, 15.0, -0.20, 0.00),
@@ -69,11 +71,11 @@ fn off_itof_xyz(x: u8, y: u8, z: u8) -> (f64, f64, f64) {
 	)
 }
 
-fn off_ftoi_xyz(x: f64, y: f64, z: f64) -> (u8, u8, u8) {
+fn off_ftoi_xyz(x: f64, y: f64, z: f64) -> (i8, i8, i8) {
 	(
-		map(x, -0.25, 0.25, 0.0, 15.0) as u8,
-		map(y, -0.2, 0.0, 0.0, 15.0) as u8,
-		map(z, -0.25, 0.25, 0.0, 15.0) as u8,
+		map(x, -0.25, 0.25, 0.0, 15.0) as i8,
+		map(y, -0.2, 0.0, 0.0, 15.0) as i8,
+		map(z, -0.25, 0.25, 0.0, 15.0) as i8,
 	)
 }
 
@@ -95,11 +97,35 @@ struct Position {
 	z: i32,
 }
 
+impl Position {
+    fn new(x: i32, y: i32, z: i32) -> Self {
+        Self { x, y, z }
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 struct Offset {
-	x: u8,
-	y: u8,
-	z: u8,
+	x: i8,
+	y: i8,
+	z: i8,
+}
+
+impl Offset {
+    fn abs(&self) -> i8 {
+        self.x.abs() + self.y.abs() + self.z.abs()
+    }
+}
+
+impl Sub for Offset {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self::Output {
+        Self {
+            x: self.x - other.x,
+            y: self.y - other.y,
+            z: self.z - other.z,
+        }
+    }
 }
 
 impl PartialEq for Offset {
@@ -107,6 +133,18 @@ impl PartialEq for Offset {
 		self.x == other.x &&
 		self.y == other.y &&
 		self.z == other.z
+	}
+}
+
+impl Sub for Position {
+	type Output = Self;
+
+	fn sub(self, other: Self) -> Self::Output {
+		Self {
+			x: self.x - other.x,
+			y: self.y - other.y,
+			z: self.z - other.z,
+		}
 	}
 }
 
@@ -138,9 +176,9 @@ fn load_grass_positions() -> Result<Vec<(Position, Offset)>, Box<dyn Error>> {
 					z: line.next().unwrap().parse::<i32>().unwrap(),
 				},
 				Offset {
-					x: line.next().unwrap().parse::<u8>().unwrap(),
-					y: line.next().unwrap().parse::<u8>().unwrap(),
-					z: line.next().unwrap().parse::<u8>().unwrap(),
+					x: line.next().unwrap().parse::<i8>().unwrap(),
+					y: line.next().unwrap().parse::<i8>().unwrap(),
+					z: line.next().unwrap().parse::<i8>().unwrap(),
 				}
 			)
 		})
