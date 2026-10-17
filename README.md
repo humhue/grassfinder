@@ -1,8 +1,8 @@
 # grassfinder
 
-Find Minecraft grass coordinates from reconstructed plant offsets. GPU-accelerated on Apple Silicon, NVIDIA and other supported GPUs through [wgpu](https://github.com/gfx-rs/wgpu), with a parallel CPU fallback.
+Find Minecraft grass coordinates from reconstructed plant offsets. GPU-accelerated on Apple Silicon, NVIDIA and other supported GPUs through [wgpu](https://github.com/gfx-rs/wgpu), with parallel CPU support if no GPU is found.
 
-Based on [polymetric's grassfinder](https://github.com/polymetric/grassfinder) and [humhue's optimizations](https://github.com/humhue/grassfinder).
+Based on [polymetric's grassfinder](https://github.com/polymetric/grassfinder).
 
 ## Install and run
 
@@ -46,7 +46,7 @@ Reported on an Apple M2 Pro, searching **8 billion candidate positions** against
 | Rayon CPU | 16.5 s | 484 million |
 | Metal GPU, pruning + compact output | **2.9–3.0 s** | **2.7 billion** |
 
-The optimized GPU run is approximately **5.7× faster** than the optimized CPU on this workload. Compared with a *reported* nine-minute run of the original implementation, it is approximately **180–186× faster**; this is a historical comparison, not a controlled same-machine benchmark of identical builds. Your hardware, sample count and thresholds will affect results.
+The optimized GPU run is approximately **5.7× faster** than the optimized CPU on this workload. Compared with a *reported* nine-minute run of the original implementation, it is approximately **180–186× faster**; this is provided as a historical comparison (it wasn't run on the same machine). Your hardware, sample count and thresholds will affect results.
 
 ## Why it is fast
 
