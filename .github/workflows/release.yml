@@ -1,0 +1,79 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ${{ matrix.slug }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            slug: macos-arm64
+            executable: grassfinder
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            slug: macos-x64
+            executable: grassfinder
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            slug: windows-x64
+            executable: grassfinder.exe
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+      - name: Test
+        shell: bash
+        run: cargo test --release --locked --target "${{ matrix.target }}"
+      - name: Build stripped release
+        shell: bash
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+      - name: Package
+        shell: bash
+        run: |
+          python .github/scripts/package.py \
+            --target "${{ matrix.target }}" \
+            --platform "${{ matrix.slug }}" \
+            --tag "${{ github.ref_name }}" \
+            --exe "${{ matrix.executable }}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.slug }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+      - uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.zip
+            dist/*.tar.gz

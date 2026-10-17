@@ -1,38 +1,60 @@
 # grassfinder
-finds coords of a minecraft screenshot using the offsets of tall grass. use [manualgrass](https://github.com/polymetric/mcah-manualgrass) to acquire these offsets
 
+Find Minecraft grass coordinates from reconstructed plant offsets. GPU-accelerated on Apple Silicon, NVIDIA and other supported GPUs through [wgpu](https://github.com/gfx-rs/wgpu), with a parallel CPU fallback.
 
-# Differences Between This Fork and the Original Program (Polymetric's Version) by ChatGPT
+Based on [polymetric's grassfinder](https://github.com/polymetric/grassfinder) and [humhue's optimizations](https://github.com/humhue/grassfinder).
 
-This fork introduces several key changes and optimizations compared to the original program (Polymetric's version). Here is a detailed breakdown of the improvements:
+## Install and run
 
-1. **Early Exit Optimization**
+**Windows / macOS:** Download the matching archive from [Releases](https://github.com/humhue/grassfinder/releases), extract it, open a terminal in the extracted `grassfinder` directory and run:
 
-   - The `get_pos_delta` function in this fork introduces an early exit mechanism if `total_delta` exceeds `max_total_delta`. This allows the computation to terminate prematurely when an unfavorable result is evident, thereby significantly reducing unnecessary iterations and saving valuable computation time. ~~In the original program, each offset difference was calculated for every single grass plant, for every single block in the 3D range in the list before comparing the total sum to the maximum value, which made the total execution time grow exponentially based on the number of grass blocks in the formation. The lack of an early exit mechanism meant that the more grass blocks there were, the exponentially longer the program would take to execute leading to a computationally infeasible number of iterations.~~ No, the early return makes it like 2.5x better on most real data. This compounds with the benefit from parallel computation so it's roughly 2.5\*number_of_cores times faster.
+```sh
+# macOS
+./grassfinder
+```
 
-2. **Parallel Computation**
+```powershell
+# Windows (PowerShell)
+.\grassfinder.exe
+```
 
-   - This fork leverages the `rayon` crate for parallel processing (`use rayon::prelude::*`), whereas the original program lacks any parallel computation. By using parallel processing, the fork is able to efficiently handle larger datasets and speed up computations considerably, especially for operations involving heavy iteration.
+**From source (any supported platform):**
 
-3. **Modular Code Design**
+```sh
+cargo run --release
+```
 
-   - This fork introduces two new helper functions: `check_pos` and `get_pos_delta`:
-     - **`check_pos`**: Determines if a given test position matches the expected offsets for all rows.
-     - **`get_pos_delta`**: Computes the delta between the expected and actual offsets, with an optimization that exits early if the delta exceeds a specified threshold (`max_total_delta`).
-   - These helper functions significantly improve the modularity of the code. By breaking down key computations into reusable components, the fork reduces code duplication and improves maintainability.
+Edit `offsets.txt` with your plant positions and offsets (six integers per line: `x y z offset_x offset_y offset_z`). The first plant defines the observed origin. The included offsets are example data: replace them with your own.
 
-4. **Parameter Adjustability**
+Defaults: GPU if available, sorted plants, early pruning, compact GPU output, average delta below **5**, X/Z **[-10,000, 10,000)** and Y **[62, 82)**. Set only what you need:
 
-   - In this fork, key parameters such as `spawnrange` and `yrange` are explicitly defined and marked as adjustable (`let spawnrange = 15000; let yrange = (62, 70);`). This enhances flexibility, making it easier for developers to test different configurations.&#x20;
+```sh
+cargo run --release -- --range 20000 --delta 8
+cargo run --release -- --backend cpu
+cargo run --release -- --post-1.8  # Minecraft 1.8+ uses a Y-independent hash
+cargo run --release -- --help
+```
 
-5. **Optimized Iteration**
+For a downloaded binary, omit `cargo run --release --` and place the options after `./grassfinder` or `grassfinder.exe`. An unsigned macOS release may require approval in **System Settings → Privacy & Security** on first launch.
 
-   - The original program used a `ChebyshevIterator` (`ChebyshevIterator::new(0, 0, 2048)`) to iterate through possible test positions orderly from the spawn. In this fork, the `ChebyshevIterator` was replaced by a normal iterator to make it more easily parallelizable with `rayon`. This results in more efficient processing of positions, especially when combined with the other optimizations.
+## Performance
 
-6. **Improved Readability and Maintainability**
+Reported on an Apple M2 Pro, searching **8 billion candidate positions** against **11 grass plants**, at average delta **5**:
 
-   - By adding modular functions (`check_pos` and `get_pos_delta`) and reducing code repetition, this fork makes the code more readable and easier to maintain. These improvements lower the chances of errors, simplify future modifications, and make the program structure  clearer.
+| Implementation | Time | Positions/sec |
+|---|---:|---:|
+| Rayon CPU | 16.5 s | 484 million |
+| Metal GPU, pruning + compact output | **2.9–3.0 s** | **2.7 billion** |
 
-## Summary
+The optimized GPU run is approximately **5.7× faster** than the optimized CPU on this workload. Compared with a *reported* nine-minute run of the original implementation, it is approximately **180–186× faster**; this is a historical comparison, not a controlled same-machine benchmark of identical builds. Your hardware, sample count and thresholds will affect results.
 
-This fork builds on the incredible work done by Polymetric. The original program laid a solid foundation with great vision, and this fork aims to further those ideas by making specific performance improvements. By incorporating parallel processing, modular functions, adjustable parameters, and an optimized early exit mechanism, this fork strives to enhance efficiency and maintainability while staying true to the original vision. These optimizations are meant to honor the innovative work of Polymetric's work, making it even more suitable for complex, large-scale scenarios.
+## Why it is fast
+
+- **Rayon:** parallel CPU search across available cores.
+- **Early rejection:** stop checking a candidate after its accumulated error reaches `average_delta × plant_count`.
+- **Plant ordering:** test offsets with the largest expected mismatch against random positions first.
+- **32-bit hash:** uses wrapping 32-bit arithmetic while preserving the relevant offset bits.
+- **wgpu GPU compute:** runs on Metal (macOS), Vulkan and DirectX backends.
+- **Compact readback:** return matching candidates only rather than one score per world position; batches keep memory bounded.
+
+See [doc.md](doc.md) for the algorithm, input format, implementation details and alternative benchmarking modes. The original code and derivative project are distributed under the [MIT license](LICENSE.txt).

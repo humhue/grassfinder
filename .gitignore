@@ -1,4 +1,6 @@
-/target
-.*~
-.*.swp
+target/
+.DS_Store
+*.swp
 *~
+.idea/
+.vscode/
