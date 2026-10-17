@@ -21,6 +21,8 @@ struct Plant { relative: Pos, observed: Offset }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Backend { Auto, Gpu, Cpu }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum CpuLoop { Flat, Column, Grouped, Full }
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum GpuLoop { Full, Prune, Grouped, TwoStage }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum GpuOutput { Full, Compact }
@@ -28,6 +30,7 @@ enum GpuOutput { Full, Compact }
 #[derive(Debug)]
 struct Options {
     backend: Backend,
+    cpu_loop: CpuLoop,
     gpu_loop: GpuLoop,
     gpu_output: GpuOutput,
     group_size: u32,
@@ -47,7 +50,7 @@ struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            backend: Backend::Auto, gpu_loop: GpuLoop::Prune,
+            backend: Backend::Auto, cpu_loop: CpuLoop::Grouped, gpu_loop: GpuLoop::Prune,
             gpu_output: GpuOutput::Compact, group_size: 4, stage1_plants: 4, match_cap: 16_384,
             // Defaults match the benchmarked 8-billion-position search.
             range: 10_000, y_min: 62, y_max: 82,
@@ -67,6 +70,11 @@ USAGE:
 
 OPTIONS:
   --backend auto|gpu|cpu   GPU with CPU fallback by default (auto)
+  --cpu-loop flat|column|grouped|full    CPU algorithm (default: grouped)
+                             flat: old per-position scan (comparison baseline)
+                             column: reuse X/Z hashes across Y; prune each plant
+                             grouped: column + prune after first four plants
+                             full: column + compare all plants, no pruning
   --gpu-loop full|prune|grouped|two-stage  GPU search strategy (default: prune)
   --group-size N          Grass tests between checks in grouped mode (default 4)
   --stage1-plants N       Grass tests in stage one (two-stage mode, default 4)
@@ -113,6 +121,11 @@ fn options() -> Result<Option<Options>> {
             "--backend" => opt.backend = match value()?.as_str() {
                 "auto" => Backend::Auto, "gpu" => Backend::Gpu, "cpu" => Backend::Cpu,
                 other => return Err(format!("invalid backend: {other}").into()),
+            },
+            "--cpu-loop" => opt.cpu_loop = match value()?.as_str() {
+                "flat" => CpuLoop::Flat, "column" => CpuLoop::Column,
+                "grouped" => CpuLoop::Grouped, "full" => CpuLoop::Full,
+                other => return Err(format!("invalid CPU loop: {other}").into()),
             },
             "--gpu-loop" => opt.gpu_loop = match value()?.as_str() {
                 "full" => GpuLoop::Full, "prune" => GpuLoop::Prune,
@@ -229,6 +242,132 @@ fn eval_cpu(candidate: Pos, plants: &[Plant], cutoff: u32, post_112: bool) -> u3
         if total >= cutoff { return FAIL; }
     }
     total
+}
+
+
+// CPU-only optimization: the X and Z part of the grass seed does not depend on Y.
+// Prepare it once per X/Z column and reuse it for every candidate Y.  The GPU
+// shader and the CPU reference evaluator above remain unchanged.
+#[derive(Copy, Clone)]
+struct CpuColumnPlant {
+    horizontal_seed: u32,
+    relative_y: i32,
+    observed: Offset,
+}
+
+impl Default for CpuColumnPlant {
+    fn default() -> Self {
+        Self {
+            horizontal_seed: 0,
+            relative_y: 0,
+            observed: Offset { x: 0, y: 0, z: 0 },
+        }
+    }
+}
+
+#[inline(always)]
+fn prepare_cpu_column(x: i32, z: i32, plants: &[Plant], prepared: &mut [CpuColumnPlant]) {
+    for (&plant, item) in plants.iter().zip(prepared.iter_mut()) {
+        let px = x.wrapping_add(plant.relative.x) as u32;
+        let pz = z.wrapping_add(plant.relative.z) as u32;
+        *item = CpuColumnPlant {
+            horizontal_seed: px.wrapping_mul(0x2fc20f) ^ pz.wrapping_mul(0x6ebfff5),
+            relative_y: plant.relative.y,
+            observed: plant.observed,
+        };
+    }
+}
+
+#[inline(always)]
+fn cpu_prepared_difference(y: i32, plant: CpuColumnPlant, post_112: bool) -> u32 {
+    let seed = plant.horizontal_seed ^ (if post_112 {
+        0
+    } else {
+        y.wrapping_add(plant.relative_y) as u32
+    });
+    let hash = seed.wrapping_mul(seed).wrapping_mul(0x285b825)
+        .wrapping_add(seed.wrapping_mul(11));
+    (plant.observed.x - ((hash >> 16) & 15) as i32).unsigned_abs()
+        + (plant.observed.y - ((hash >> 20) & 15) as i32).unsigned_abs()
+        + (plant.observed.z - ((hash >> 24) & 15) as i32).unsigned_abs()
+}
+
+#[inline(always)]
+fn eval_cpu_prepared(y: i32, prepared: &[CpuColumnPlant], cutoff: u32,
+                     post_112: bool, strategy: CpuLoop) -> u32 {
+    let mut total = 0;
+    match strategy {
+        CpuLoop::Grouped => {
+            // No data-dependent exit inside the first group.  This may improve
+            // instruction scheduling, but can also do more hashes than Column.
+            let first = prepared.len().min(4);
+            for &plant in &prepared[..first] {
+                total += cpu_prepared_difference(y, plant, post_112);
+            }
+            if total >= cutoff { return FAIL; }
+            for &plant in &prepared[first..] {
+                total += cpu_prepared_difference(y, plant, post_112);
+                if total >= cutoff { return FAIL; }
+            }
+        }
+        CpuLoop::Full => {
+            for &plant in prepared {
+                total += cpu_prepared_difference(y, plant, post_112);
+            }
+            if total >= cutoff { return FAIL; }
+        }
+        CpuLoop::Column | CpuLoop::Flat => {
+            for &plant in prepared {
+                total += cpu_prepared_difference(y, plant, post_112);
+                if total >= cutoff { return FAIL; }
+            }
+        }
+    }
+    total
+}
+
+// Divide work by X/Z columns, not individual positions.  This eliminates two
+// 64-bit divisions per candidate and reuses two hash multiplications across all
+// Y levels.  The first and last columns can be partial, because GPU-style batch
+// boundaries need not coincide with a column boundary.
+fn scan_cpu_columns(grid: Grid, processed: u64, n: u32, plants: &[Plant],
+                    cutoff: u32, post_112: bool, strategy: CpuLoop) -> Vec<(u32, u32)> {
+    let y_count = u64::from(grid.y_count);
+    let start_col = processed / y_count;
+    let end = processed + u64::from(n);
+    let end_col = (end - 1) / y_count + 1;
+    let columns = end_col - start_col;
+    const COLUMNS_PER_BLOCK: u64 = 256;
+    let blocks = (columns + COLUMNS_PER_BLOCK - 1) / COLUMNS_PER_BLOCK;
+
+    (0..blocks).into_par_iter()
+        .fold(
+            || (vec![CpuColumnPlant::default(); plants.len()], Vec::<(u32,u32)>::new()),
+            |(mut prepared, mut hits), block| {
+                let first_col = start_col + block * COLUMNS_PER_BLOCK;
+                let last_col = (first_col + COLUMNS_PER_BLOCK).min(end_col);
+                for col in first_col..last_col {
+                    // One coordinate decoding per *column*, rather than per Y.
+                    let x = (col / u64::from(grid.width)) as i32 - grid.range;
+                    let z = (col % u64::from(grid.width)) as i32 - grid.range;
+                    prepare_cpu_column(x, z, plants, &mut prepared);
+                    let row_start = col * y_count;
+                    let y_first = processed.saturating_sub(row_start).min(y_count) as u32;
+                    let y_last = end.saturating_sub(row_start).min(y_count) as u32;
+                    for yi in y_first..y_last {
+                        let y = grid.y_min + yi as i32;
+                        let score = eval_cpu_prepared(y, &prepared, cutoff, post_112, strategy);
+                        if score != FAIL {
+                            let local = (row_start + u64::from(yi) - processed) as u32;
+                            hits.push((local, score));
+                        }
+                    }
+                }
+                (prepared, hits)
+            },
+        )
+        .map(|(_, hits)| hits)
+        .reduce(Vec::new, |mut a, mut b| { a.append(&mut b); a })
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -577,6 +716,7 @@ fn main() -> Result<()> {
         }
     } else { None };
     eprintln!("Mode: {}", if gpu.is_some() {"GPU"} else {"CPU (Rayon)"});
+    if gpu.is_none() { eprintln!("CPU loop: {:?} | Rayon workers: {}", opt.cpu_loop, rayon::current_num_threads()); }
     if gpu.is_some() { eprintln!("GPU loop: {:?} | output: {:?} | group-size: {} | first-stage plants: {} | match-cap: {}",
         opt.gpu_loop, opt.gpu_output, opt.group_size, opt.stage1_plants, opt.match_cap); }
     let mut processed: u64 = 0;
@@ -633,11 +773,16 @@ fn main() -> Result<()> {
                 eprintln!("Verified first {} candidates against CPU.", n.min(65_536));
             }
         } else {
-            let matches: Vec<(u32,u32)> = (0..n).into_par_iter().filter_map(|local| {
-                let pos = grid.position(processed + u64::from(local));
-                let sum = eval_cpu(pos, &plants, cutoff, opt.post_112);
-                (sum != FAIL).then_some((local,sum))
-            }).collect();
+            let matches: Vec<(u32,u32)> = if opt.cpu_loop == CpuLoop::Flat {
+                // Unchanged CPU baseline for A/B benchmarking.
+                (0..n).into_par_iter().filter_map(|local| {
+                    let pos = grid.position(processed + u64::from(local));
+                    let sum = eval_cpu(pos, &plants, cutoff, opt.post_112);
+                    (sum != FAIL).then_some((local, sum))
+                }).collect()
+            } else {
+                scan_cpu_columns(grid, processed, n, &plants, cutoff, opt.post_112, opt.cpu_loop)
+            };
             matched += matches.len() as u64;
             if opt.print_matches {
                 for (local, delta) in matches {
@@ -688,6 +833,7 @@ mod tests {
     fn optimized_defaults() {
         let defaults = Options::default();
         assert_eq!(defaults.backend, Backend::Auto);
+        assert_eq!(defaults.cpu_loop, CpuLoop::Grouped);
         assert_eq!(defaults.gpu_loop, GpuLoop::Prune);
         assert_eq!(defaults.gpu_output, GpuOutput::Compact);
         assert_eq!(defaults.range, 10_000);
@@ -717,6 +863,53 @@ mod tests {
         let candidate = Pos { x: 0, y: 63, z: 0 };
         assert_eq!(eval_cpu(candidate, &plants, 1, false), 0);
     }
+
+    #[test]
+    fn cpu_column_hash_matches_reference_for_all_strategies() {
+        let (_, mut plants) = load_plants("offsets.txt").unwrap();
+        rank_plants(&mut plants);
+        let mut prepared = vec![CpuColumnPlant::default(); plants.len()];
+        for &post in &[false, true] {
+            for x in [-10000, -1836, 0, 1414, 9999] {
+                for z in [-10000, -451, 0, 1414, 9999] {
+                    prepare_cpu_column(x, z, &plants, &mut prepared);
+                    for y in 62..127 {
+                        let pos = Pos {x,y,z};
+                        for cutoff in [1, 22, 55, 121, 496] {
+                            let expected = eval_cpu(pos, &plants, cutoff, post);
+                            for strategy in [CpuLoop::Column, CpuLoop::Grouped, CpuLoop::Full] {
+                                assert_eq!(eval_cpu_prepared(y, &prepared, cutoff, post, strategy),
+                                           expected, "candidate {pos:?}, strategy {strategy:?}, post {post}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_column_batches_match_flat_scan_even_on_partial_columns() {
+        let (_, mut plants) = load_plants("offsets.txt").unwrap();
+        rank_plants(&mut plants);
+        let opt = Options {range: 8, y_min: 62, y_max: 69, ..Default::default()};
+        let grid = Grid::new(&opt).unwrap();
+        for (processed, n) in [(0u64, 5u32), (3, 41), (48, 102), (300, 127), (grid.total-4, 4)] {
+            for cutoff in [22, 55, 121, 496] {
+                let mut expected: Vec<(u32,u32)> = (0..n).filter_map(|local| {
+                    let sum = eval_cpu(grid.position(processed + u64::from(local)), &plants, cutoff, false);
+                    (sum != FAIL).then_some((local, sum))
+                }).collect();
+                expected.sort_unstable();
+                for strategy in [CpuLoop::Column, CpuLoop::Grouped, CpuLoop::Full] {
+                    let mut actual = scan_cpu_columns(grid, processed, n, &plants, cutoff, false, strategy);
+                    actual.sort_unstable();
+                    assert_eq!(actual, expected, "start {processed}, strategy {strategy:?}, cutoff {cutoff}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn exact_threshold_is_exclusive() {
         let plant = Plant {relative:Pos{x:0,y:0,z:0}, observed:Offset{x:15,y:15,z:15}};

@@ -39,18 +39,27 @@ For a downloaded binary, omit `cargo run --release --` and place the options aft
 
 ## Performance
 
-Reported on an Apple M2 Pro, searching **8 billion candidate positions** against **11 grass plants**, at average delta **5**:
+Measured on an **Apple M2 Pro**, searching **26 billion candidate positions**
+(20,000 × 20,000 × 65), using **11 grass plants** with average delta **5**:
 
-| Implementation | Time | Positions/sec |
+| Implementation | Runtime | Throughput |
 |---|---:|---:|
-| Rayon CPU | 16.5 s | 484 million |
-| Metal GPU, pruning + compact output | **2.9–3.0 s** | **2.7 billion** |
+| Original-style single-thread CPU (11 plants per position) | ~492 s (projected) | 52.9 million positions/s |
+| Optimized CPU, grouped pruning (12 Rayon workers) | **24.859 s** | **1.046 billion positions/s** |
+| GPU, Metal, pruning + compact output | **9.427 s** | **2.758 billion positions/s** |
 
-The optimized GPU run is approximately **5.7× faster** than the optimized CPU on this workload. Compared with a *reported* nine-minute run of the original implementation, it is approximately **180–186× faster**; this is provided as a historical comparison (it wasn't run on the same machine). Your hardware, sample count and thresholds will affect results.
+The optimized CPU is approximately **19.8× faster** than the original-style
+single-thread baseline; the GPU is approximately **52.1× faster**. The GPU is
+approximately **2.64× faster** than the optimized CPU on this workload.
+
+Even with **one CPU worker**, grouped pruning reaches approximately **139 million
+positions/s**, about a **2.6×** speed up over the original's 52.9 million positions/s.
+
+Results can vary depending on your hardware and input.
 
 ## Why it is fast
 
-- **Rayon:** parallel CPU search across available cores.
+- **Rayon CPU:** automatic worker count, column-based hash reuse across Y levels, and grouped pruning (first four plants checked together).
 - **Early rejection:** stop checking a candidate after its accumulated error reaches `average_delta × plant_count`.
 - **Plant ordering:** test offsets with the largest expected mismatch against random positions first.
 - **32-bit hash:** uses wrapping 32-bit arithmetic while preserving the relevant offset bits.

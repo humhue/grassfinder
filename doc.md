@@ -39,11 +39,24 @@ An average delta of 5 is useful for imperfectly reconstructed screenshots but is
 
 ## CPU optimizations
 
-The original sequential search evaluated every observed plant at every candidate position. This implementation divides candidate world positions across Rayon workers.
+The CPU backend uses [Rayon](https://github.com/rayon-rs/rayon) to split the search across available logical CPU threads. By default it selects the `grouped` strategy automatically; `RAYON_NUM_THREADS` can override the worker count for benchmarking.
 
-Within each candidate, accumulated absolute errors can only increase. Therefore, when the running error reaches the maximum permitted *total*, the candidate can be rejected immediately without evaluating the remaining plants. Worst-case work is still `O(positions × plants)`, but average work is often much smaller.
+**Column-based search.** Instead of converting a flattened index back into X, Y and Z for every candidate, the CPU iterates over X/Z columns and evaluates their Y levels in sequence. For each column and grass plant, it calculates the X/Z-dependent portion of the hash seed once and reuses it at every Y level. This avoids repeated 64-bit quotient/remainder operations and two coordinate multiplications per plant per Y level. Work is still divided into batches and columns across Rayon workers.
 
-Plants are sorted *once*, before search, by their expected absolute deviation against a uniformly distributed random four-bit offset. Offsets near 0 or 15 usually produce more error against a random candidate than offsets near 7 or 8, so checking them first often helps early rejection. Ordering does not change accepted matches.
+**Grouped pruning (CPU default).** The first four plants are evaluated together without a data-dependent early exit, allowing the CPU more freedom to schedule their independent arithmetic. If their accumulated error already reaches the cutoff, the candidate is rejected. Otherwise, the remaining plants are evaluated individually, with early rejection after each one. This keeps the same match criterion as a full evaluation. A plain `column` mode checks the cutoff after *every* plant; for this workload, grouped pruning measured substantially faster.
+
+**Plant ordering.** Before searching, plants are sorted once by expected absolute error against a uniformly distributed four-bit offset. Observed offsets near 0 or 15 typically differ more from random candidate offsets than values near 7 or 8, so testing them first often improves pruning. Sorting does not change which candidates match.
+
+**Available CPU strategies:**
+
+```sh
+cargo run --release -- --backend cpu --cpu-loop grouped --no-matches
+cargo run --release -- --backend cpu --cpu-loop column  --no-matches
+cargo run --release -- --backend cpu --cpu-loop full    --no-matches
+cargo run --release -- --backend cpu --cpu-loop flat    --no-matches
+```
+
+All these modes preserve the same error calculation and accepted candidates. They differ only in traversal and how much computation is skipped. Worst-case work remains `O(positions × plants)`.
 
 ## GPU execution
 
@@ -63,18 +76,37 @@ cargo run --release -- --backend cpu --no-matches
 
 The `two-stage` mode filters candidates with the first few plants, compacts intermediate survivors and processes survivors in a second dispatch. It can lose to direct pruning because of compaction and dispatch overhead.
 
-## Benchmark reproducibly
+## Performance and reproducibility
 
-Keep identical bounds, offsets, threshold, hardware and binary build. For a short correctness test:
+Measured on an **Apple M2 Pro** with **11 grass plants**, an **average delta threshold of 5**, and **26 billion candidate positions** (20,000 × 20,000 × 65; X/Z `[-10000, 10000)`, Y `[62, 127)`):
+
+| Implementation | Time | Throughput |
+|---|---:|---:|
+| Original-style single-thread CPU | ~492 s | ~52.9 million positions/s |
+| Optimized CPU: grouped pruning, automatic Rayon (12 workers) | **24.859 s** | **1.046 billion positions/s** |
+| Metal GPU: pruning and compact output | **9.427 s** | **2.758 billion positions/s** |
+
+Compared with the original-style single-thread baseline, the optimized CPU is approximately **19.8× faster** and the GPU **52.1× faster**. The GPU is **2.64× faster** than the optimized CPU for this workload.
+
+In additional single-worker tests, the CPU `flat` mode processed about **56 million positions/s**, `column` about **81 million/s**, `full` about **102 million/s**, and `grouped` about **139 million/s**.
+
+The original-style reference retains polymetric's full, unpruned per-position comparison and 64-bit grass hash, but replaces its spiral search with rectangular bounds for comparison. All figures are hardware- and input-dependent.
+
+For correctness checks:
 
 ```sh
 cargo test --release
 cargo run --release -- --backend gpu --range 8 --y-min 62 --y-max 65 --file test_known_offsets.txt --verify
 ```
 
-On one Apple M2 Pro with eleven plants and a delta threshold of five, the default eight-billion-position run took about 16.5 seconds on Rayon CPU and 2.9–3.0 seconds on Metal GPU (approximately 2.7 billion candidate positions/s). These measurements are user-supplied, not independent benchmarks on every supported device.
+To reproduce the completed CPU/GPU comparisons on the sample offsets, with the long Y range explicitly enabled:
 
-A historical note in the prior documentation describes an approximately nine-minute original-program search with a *different* 26-billion-position, five-plant workload. Consequently, interpreting the nine-minute and 2.9-second figures as a controlled speedup requires an identical original-program rerun. On nominal wall-clock figures alone, 540/2.9 is roughly 186×.
+```sh
+cargo run --release -- --backend cpu --cpu-loop grouped --range 10000 --y-min 62 --y-max 127 --delta 5 --no-matches
+cargo run --release -- --backend gpu --gpu-loop prune --gpu-output compact --range 10000 --y-min 62 --y-max 127 --delta 5 --no-matches
+```
+
+Rayon uses the machine's available logical processors by default; for a controlled single-worker comparison, prefix a CPU command with `RAYON_NUM_THREADS=1`. GPU code and shader logic are independent of the CPU-specific column and grouped optimizations.
 
 ## History, license and credits
 
