@@ -1,6 +1,6 @@
 [package]
 name = "grassfinder"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "Grass-coordinate finder using wgpu (Metal/Vulkan/DX12) and Rayon CPU fallback"
 

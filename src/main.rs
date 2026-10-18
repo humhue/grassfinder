@@ -21,9 +21,11 @@ struct Plant { relative: Pos, observed: Offset }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum Backend { Auto, Gpu, Cpu }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum CpuLoop { Flat, Column, Grouped, Full }
+enum CpuLoop { Flat, Column, Grouped, Full, Tiled }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum GpuLoop { Full, Prune, Grouped, TwoStage }
+enum CpuError { Direct, Lut }
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum GpuLoop { Full, Prune, Grouped, TwoStage, Lut }
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum GpuOutput { Full, Compact }
 
@@ -31,6 +33,8 @@ enum GpuOutput { Full, Compact }
 struct Options {
     backend: Backend,
     cpu_loop: CpuLoop,
+    cpu_error: CpuError,
+    tile_size: u32,
     gpu_loop: GpuLoop,
     gpu_output: GpuOutput,
     group_size: u32,
@@ -50,7 +54,7 @@ struct Options {
 impl Default for Options {
     fn default() -> Self {
         Self {
-            backend: Backend::Auto, cpu_loop: CpuLoop::Grouped, gpu_loop: GpuLoop::Prune,
+            backend: Backend::Auto, cpu_loop: CpuLoop::Tiled, cpu_error: CpuError::Lut, tile_size: 128, gpu_loop: GpuLoop::Lut,
             gpu_output: GpuOutput::Compact, group_size: 4, stage1_plants: 4, match_cap: 16_384,
             // Defaults match the benchmarked 8-billion-position search.
             range: 10_000, y_min: 62, y_max: 82,
@@ -70,12 +74,16 @@ USAGE:
 
 OPTIONS:
   --backend auto|gpu|cpu   GPU with CPU fallback by default (auto)
-  --cpu-loop flat|column|grouped|full    CPU algorithm (default: grouped)
+  --cpu-loop flat|column|grouped|full|tiled  CPU strategy (default: tiled)
                              flat: old per-position scan (comparison baseline)
                              column: reuse X/Z hashes across Y; prune each plant
                              grouped: column + prune after first four plants
                              full: column + compare all plants, no pruning
-  --gpu-loop full|prune|grouped|two-stage  GPU search strategy (default: prune)
+                             tiled: cache hashes in overlapping 2D X/Z tiles
+  --cpu-error direct|lut  Use arithmetic errors or 4K-entry LUT/plant (default lut)
+  --tile-size N           Tiled CPU square edge, 8..128 (default 128)
+  --gpu-loop full|prune|grouped|two-stage|lut  (default: lut)
+                             lut: per-plant GPU error lookup table with pruning
   --group-size N          Grass tests between checks in grouped mode (default 4)
   --stage1-plants N       Grass tests in stage one (two-stage mode, default 4)
   --gpu-output full|compact   Read back all scores or only matches (default: compact)
@@ -125,11 +133,18 @@ fn options() -> Result<Option<Options>> {
             "--cpu-loop" => opt.cpu_loop = match value()?.as_str() {
                 "flat" => CpuLoop::Flat, "column" => CpuLoop::Column,
                 "grouped" => CpuLoop::Grouped, "full" => CpuLoop::Full,
+                "tiled" => CpuLoop::Tiled,
                 other => return Err(format!("invalid CPU loop: {other}").into()),
             },
+            "--cpu-error" => opt.cpu_error = match value()?.as_str() {
+                "direct" => CpuError::Direct, "lut" => CpuError::Lut,
+                other => return Err(format!("invalid CPU error mode: {other}").into()),
+            },
+            "--tile-size" => opt.tile_size = value()?.parse()?,
             "--gpu-loop" => opt.gpu_loop = match value()?.as_str() {
                 "full" => GpuLoop::Full, "prune" => GpuLoop::Prune,
                 "grouped" => GpuLoop::Grouped, "two-stage" => GpuLoop::TwoStage,
+                "lut" => GpuLoop::Lut,
                 other => return Err(format!("invalid GPU loop: {other}").into()),
             },
             "--gpu-output" => opt.gpu_output = match value()?.as_str() {
@@ -168,6 +183,7 @@ fn options() -> Result<Option<Options>> {
     if opt.group_size == 0 || opt.group_size > 4096 {
         return Err("--group-size must be in 1..=4096".into());
     }
+    if !(8..=128).contains(&opt.tile_size) { return Err("--tile-size must be in 8..=128".into()); }
     if opt.stage1_plants == 0 {
         return Err("--stage1-plants must be at least 1".into());
     }
@@ -316,11 +332,63 @@ fn eval_cpu_prepared(y: i32, prepared: &[CpuColumnPlant], cutoff: u32,
             }
             if total >= cutoff { return FAIL; }
         }
-        CpuLoop::Column | CpuLoop::Flat => {
+        CpuLoop::Column | CpuLoop::Flat | CpuLoop::Tiled => {
             for &plant in prepared {
                 total += cpu_prepared_difference(y, plant, post_112);
                 if total >= cutoff { return FAIL; }
             }
+        }
+    }
+    total
+}
+
+// Precompute absolute error for each possible 12-bit grass offset.
+// This experiment replaces three subtractions + abs operations per plant
+// with one random lookup into a ~44 KiB table (for 11 plants).
+fn make_error_tables(plants: &[Plant]) -> Vec<[u8; 4096]> {
+    plants.iter().map(|p| {
+        let mut table = [0u8; 4096];
+        for (packed, item) in table.iter_mut().enumerate() {
+            let x = (packed & 15) as i32;
+            let y = ((packed >> 4) & 15) as i32;
+            let z = ((packed >> 8) & 15) as i32;
+            *item = ((p.observed.x-x).abs() + (p.observed.y-y).abs()
+                + (p.observed.z-z).abs()) as u8;
+        }
+        table
+    }).collect()
+}
+
+#[inline(always)]
+fn prepared_lut_difference(y: i32, plant: CpuColumnPlant, table: &[u8;4096],
+                           post_112: bool) -> u32 {
+    let seed = plant.horizontal_seed ^ if post_112 { 0u32 } else {
+        y.wrapping_add(plant.relative_y) as u32
+    };
+    let hash = seed.wrapping_mul(seed).wrapping_mul(0x285b825)
+        .wrapping_add(seed.wrapping_mul(11));
+    u32::from(table[((hash >> 16) & 0xfff) as usize])
+}
+
+#[inline(always)]
+fn eval_cpu_prepared_lut(y: i32, prepared: &[CpuColumnPlant], tables: &[[u8;4096]],
+                         cutoff: u32, post_112: bool, strategy: CpuLoop) -> u32 {
+    let mut total = 0u32;
+    if matches!(strategy, CpuLoop::Grouped) {
+        let first = prepared.len().min(4);
+        for i in 0..first { total += prepared_lut_difference(y, prepared[i], &tables[i], post_112); }
+        if total >= cutoff { return FAIL; }
+        for i in first..prepared.len() {
+            total += prepared_lut_difference(y, prepared[i], &tables[i], post_112);
+            if total >= cutoff { return FAIL; }
+        }
+    } else if matches!(strategy, CpuLoop::Full) {
+        for i in 0..prepared.len() { total += prepared_lut_difference(y, prepared[i], &tables[i], post_112); }
+        if total >= cutoff { return FAIL; }
+    } else {
+        for i in 0..prepared.len() {
+            total += prepared_lut_difference(y, prepared[i], &tables[i], post_112);
+            if total >= cutoff { return FAIL; }
         }
     }
     total
@@ -331,7 +399,8 @@ fn eval_cpu_prepared(y: i32, prepared: &[CpuColumnPlant], cutoff: u32,
 // Y levels.  The first and last columns can be partial, because GPU-style batch
 // boundaries need not coincide with a column boundary.
 fn scan_cpu_columns(grid: Grid, processed: u64, n: u32, plants: &[Plant],
-                    cutoff: u32, post_112: bool, strategy: CpuLoop) -> Vec<(u32, u32)> {
+                    cutoff: u32, post_112: bool, strategy: CpuLoop,
+                    tables: Option<&[[u8;4096]]>) -> Vec<(u32, u32)> {
     let y_count = u64::from(grid.y_count);
     let start_col = processed / y_count;
     let end = processed + u64::from(n);
@@ -356,7 +425,9 @@ fn scan_cpu_columns(grid: Grid, processed: u64, n: u32, plants: &[Plant],
                     let y_last = end.saturating_sub(row_start).min(y_count) as u32;
                     for yi in y_first..y_last {
                         let y = grid.y_min + yi as i32;
-                        let score = eval_cpu_prepared(y, &prepared, cutoff, post_112, strategy);
+                        let score = if let Some(t) = tables {
+                            eval_cpu_prepared_lut(y, &prepared, t, cutoff, post_112, strategy)
+                        } else { eval_cpu_prepared(y, &prepared, cutoff, post_112, strategy) };
                         if score != FAIL {
                             let local = (row_start + u64::from(yi) - processed) as u32;
                             hits.push((local, score));
@@ -368,6 +439,159 @@ fn scan_cpu_columns(grid: Grid, processed: u64, n: u32, plants: &[Plant],
         )
         .map(|(_, hits)| hits)
         .reduce(Vec::new, |mut a, mut b| { a.append(&mut b); a })
+}
+
+// CPU-only spatial tile cache.  Every tile computes each relevant world
+// grass hash once, then the candidate/pruning loop retrieves the packed 12-bit
+// offset.  Halo dimensions cover all relative plant positions.  No GPU change.
+#[derive(Clone, Copy)]
+struct TileHalo { min_x: i32, min_y: i32, min_z: i32, nx: usize, ny: usize, nz: usize }
+fn tile_halo(plants: &[Plant], post_112: bool, tile_size: u32, y_count: u32) -> Result<TileHalo> {
+    let xs = plants.iter().map(|p| p.relative.x);
+    let ys = plants.iter().map(|p| if post_112 {0} else {p.relative.y});
+    let zs = plants.iter().map(|p| p.relative.z);
+    let min_x = xs.clone().min().unwrap_or(0);
+    let min_y = ys.clone().min().unwrap_or(0);
+    let min_z = zs.clone().min().unwrap_or(0);
+    let dx = i64::from(xs.max().unwrap_or(0)) - i64::from(min_x);
+    let dy = i64::from(ys.max().unwrap_or(0)) - i64::from(min_y);
+    let dz = i64::from(zs.max().unwrap_or(0)) - i64::from(min_z);
+    let nx = usize::try_from(i64::from(tile_size) + dx)?;
+    let ny = usize::try_from(i64::from(y_count) + dy)?;
+    let nz = usize::try_from(i64::from(tile_size) + dz)?;
+    let n = nx.checked_mul(ny).and_then(|v| v.checked_mul(nz)).ok_or("tile too large")?;
+    if n > 4_000_000 { return Err(format!("spatial cache too large: {n} u16 entries per Rayon worker; reduce --tile-size or plant coordinate spread").into()); }
+    Ok(TileHalo { min_x, min_y, min_z, nx, ny, nz })
+}
+
+#[inline(always)]
+fn direct_packed_error(packed: u16, observed: Offset) -> u32 {
+    (observed.x - i32::from(packed & 15)).unsigned_abs()
+      + (observed.y - i32::from((packed >> 4) & 15)).unsigned_abs()
+      + (observed.z - i32::from((packed >> 8) & 15)).unsigned_abs()
+}
+
+#[inline(always)]
+fn eval_cached<const USE_LUT: bool>(base: usize, cache: &[u16], deltas: &[usize],
+                                    plants: &[Plant], tables: &[[u8;4096]], cutoff: u32) -> u32 {
+    let mut total = 0u32;
+    let first = plants.len().min(4);
+    for i in 0..first {
+        let h = cache[base + deltas[i]];
+        total += if USE_LUT { u32::from(tables[i][h as usize]) }
+            else { direct_packed_error(h, plants[i].observed) };
+    }
+    if total >= cutoff { return FAIL; }
+    for i in first..plants.len() {
+        let h = cache[base + deltas[i]];
+        total += if USE_LUT { u32::from(tables[i][h as usize]) }
+            else { direct_packed_error(h, plants[i].observed) };
+        if total >= cutoff { return FAIL; }
+    }
+    total
+}
+
+// Tiles are independent, with no cache shared across tiles.  They are evaluated
+// in batches of 64; each worker reuses its own cache allocation.
+fn scan_cpu_tile_batch<const USE_LUT: bool>(grid: Grid, tile_size: u32, begin: u64, end: u64,
+        plants: &[Plant], tables: &[[u8;4096]], cutoff: u32, post_112: bool,
+        halo: TileHalo) -> (u64, Vec<(Pos,u32)>) {
+    let ntz = u64::from(grid.width.div_ceil(tile_size));
+    (begin..end).into_par_iter().fold(
+        || (Vec::<u16>::new(), 0u64, Vec::<(Pos,u32)>::new()),
+        |(mut cache, mut count, mut hits), id| {
+            let tx = (id / ntz) as u32;
+            let tz = (id % ntz) as u32;
+            let x_start = tx * tile_size;
+            let z_start = tz * tile_size;
+            let cx = (grid.width-x_start).min(tile_size) as usize;
+            let cz = (grid.width-z_start).min(tile_size) as usize;
+            let sx = halo.nx - tile_size as usize + cx;
+            let sz = halo.nz - tile_size as usize + cz;
+            let sy = halo.ny;
+            let n = sx*sz*sy;
+            cache.resize(n, 0);
+            let stride_x = sz*sy;
+            let stride_z = sy;
+            let base_x = x_start as i32 - grid.range;
+            let base_z = z_start as i32 - grid.range;
+            for ix in 0..sx {
+                let wx = base_x.wrapping_add(halo.min_x).wrapping_add(ix as i32);
+                let a = (wx as u32).wrapping_mul(0x2fc20f);
+                for iz in 0..sz {
+                    let wz = base_z.wrapping_add(halo.min_z).wrapping_add(iz as i32);
+                    let horiz = a ^ (wz as u32).wrapping_mul(0x6ebfff5);
+                    let off = ix*stride_x + iz*stride_z;
+                    for iy in 0..sy {
+                        let wy = grid.y_min.wrapping_add(halo.min_y).wrapping_add(iy as i32);
+                        let seed = horiz ^ if post_112 { 0 } else { wy as u32 };
+                        let h = seed.wrapping_mul(seed).wrapping_mul(0x285b825)
+                            .wrapping_add(seed.wrapping_mul(11));
+                        cache[off+iy] = ((h >> 16) & 0xfff) as u16;
+                    }
+                }
+            }
+            let deltas: Vec<usize> = plants.iter().map(|p| {
+                let dx = (i64::from(p.relative.x)-i64::from(halo.min_x)) as usize;
+                let dy = (if post_112 {0} else {i64::from(p.relative.y)})-i64::from(halo.min_y);
+                let dz = (i64::from(p.relative.z)-i64::from(halo.min_z)) as usize;
+                dx*stride_x + dz*stride_z + (dy as usize)
+            }).collect();
+            count += (cx*cz) as u64 * u64::from(grid.y_count);
+            for ix in 0..cx {
+                for iz in 0..cz {
+                    let base = ix*stride_x + iz*stride_z;
+                    for iy in 0..(grid.y_count as usize) {
+                        let score = eval_cached::<USE_LUT>(base+iy, &cache, &deltas, plants, tables, cutoff);
+                        if score != FAIL {
+                            hits.push((Pos { x: base_x+ix as i32, y: grid.y_min+iy as i32,
+                                z:base_z+iz as i32 }, score));
+                        }
+                    }
+                }
+            }
+            (cache, count, hits)
+        }).map(|(_,n,h)| (n,h))
+        .reduce(|| (0u64, Vec::<(Pos,u32)>::new()), |(a,mut ah),(b,mut bh)| {
+            ah.append(&mut bh); (a+b,ah)
+        })
+}
+
+fn run_cpu_tiles(grid: Grid, opt: &Options, plants: &[Plant], tables: &[[u8;4096]],
+                 cutoff: u32, origin: Pos) -> Result<()> {
+    let halo = tile_halo(plants, opt.post_112, opt.tile_size, grid.y_count)?;
+    let tile_dim = u64::from(grid.width.div_ceil(opt.tile_size));
+    let n_tiles = tile_dim * tile_dim;
+    eprintln!("Tile cache: {}x{} X/Z; packed u16 hashes; max {:.2} MiB/worker",
+        opt.tile_size, opt.tile_size,
+        (halo.nx*halo.ny*halo.nz*2) as f64 / (1024.0*1024.0));
+    let start = Instant::now();
+    let mut last_report = Instant::now();
+    let mut done = 0u64;
+    let mut matched = 0u64;
+    for first in (0..n_tiles).step_by(64) {
+        let last = (first+64).min(n_tiles);
+        let (count, matches) = if opt.cpu_error == CpuError::Lut {
+            scan_cpu_tile_batch::<true>(grid, opt.tile_size, first, last, plants, tables, cutoff,
+                opt.post_112, halo)
+        } else {
+            scan_cpu_tile_batch::<false>(grid, opt.tile_size, first, last, plants, tables, cutoff,
+                opt.post_112, halo)
+        };
+        done += count;
+        matched += matches.len() as u64;
+        if opt.print_matches {
+            for (pos, score) in matches { report_match(pos, origin, score, plants.len()); }
+        }
+        if last_report.elapsed() >= Duration::from_secs(5) || last == n_tiles {
+            progress(done, grid.total, start, matched);
+            last_report = Instant::now();
+        }
+    }
+    eprintln!("Finished: {} candidates, {} matches, {:.3} seconds, {:.3} million candidates/second.",
+        done, matched, start.elapsed().as_secs_f64(),
+        done as f64 / start.elapsed().as_secs_f64().max(0.000001) / 1_000_000.0);
+    Ok(())
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -404,6 +628,9 @@ struct GpuParams {
     range:i32, y_min:i32, y_count:u32, width:u32,
     plant_count:u32, cutoff:u32, post_112:u32, prune:u32,
     group_size:u32, stage1_count:u32, compact:u32, match_cap:u32,
+    tile_base:u32, tiles_per_row:u32, y_tiles:u32, halo_x_min:i32,
+    halo_x_size:u32, halo_z_min:i32, halo_z_size:u32, halo_y_min:i32,
+    halo_y_size:u32, cache_words:u32, reserved0:u32, reserved1:u32,
 }
 
 struct GpuSearch {
@@ -412,6 +639,8 @@ struct GpuSearch {
     pipeline: wgpu::ComputePipeline,
     stage1_pipeline: wgpu::ComputePipeline,
     stage2_pipeline: wgpu::ComputePipeline,
+    lut_pipeline: wgpu::ComputePipeline,
+    experimental_bind_group: wgpu::BindGroup,
     indirect_pipeline: wgpu::ComputePipeline,
     bind_group: wgpu::BindGroup,
     indirect_bind_group: wgpu::BindGroup,
@@ -494,6 +723,19 @@ impl GpuSearch {
             contents: bytemuck::cast_slice(&gpu_plants),
             usage: wgpu::BufferUsages::STORAGE,
         });
+        // Four packed u8 errors per u32: 11 plants * 1024 words = 44 KiB.
+        let error_tables = make_error_tables(plants);
+        let mut packed_lut: Vec<u32> = Vec::with_capacity(plants.len() * 1024);
+        for table in &error_tables {
+            for bytes in table.chunks_exact(4) {
+                packed_lut.push(u32::from_le_bytes(bytes.try_into().unwrap()));
+            }
+        }
+        let lut_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("GPU packed plant error LUT"),
+            contents: bytemuck::cast_slice(&packed_lut),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
         let params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("search chunk parameters"), size: std::mem::size_of::<GpuParams>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
@@ -547,6 +789,45 @@ impl GpuSearch {
                 wgpu::BindGroupEntry { binding: 5, resource: match_buffer.as_entire_binding() },
             ],
         });
+        // Independent pipeline layout so the original GPU shader is untouched.
+        let mut exp_entries = entries.clone();
+        exp_entries.push(wgpu::BindGroupLayoutEntry {
+            binding: 6, visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false, min_binding_size: None,
+            }, count: None,
+        });
+        let exp_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("grass GPU LUT layout"), entries: &exp_entries,
+        });
+        let exp_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("grass GPU LUT pipeline layout"),
+            bind_group_layouts: &[Some(&exp_layout)], immediate_size: 0,
+        });
+        let exp_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("grass GPU packed error lookup shader"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("gpu_experiments.wgsl").into()),
+        });
+        let make_exp_pipeline = |label: &'static str, entry: &'static str| {
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label), layout: Some(&exp_pipeline_layout), module: &exp_shader,
+                entry_point: Some(entry), compilation_options: Default::default(), cache: None,
+            })
+        };
+        let lut_pipeline = make_exp_pipeline("grass GPU error LUT", "lut_main");
+        let experimental_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("grass GPU LUT inputs"), layout: &exp_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: plants_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: output.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: survivors.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: survivor_counter.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: match_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 6, resource: lut_buffer.as_entire_binding() },
+            ],
+        });
         let indirect_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("prepare indirect dispatch"),
             layout: &indirect_pipeline.get_bind_group_layout(0),
@@ -556,6 +837,7 @@ impl GpuSearch {
             ],
         });
         Ok(Self { device, queue, pipeline, stage1_pipeline, stage2_pipeline,
+            lut_pipeline, experimental_bind_group,
             indirect_pipeline, bind_group, indirect_bind_group, params_buffer,
             output, staging, survivor_counter, dispatch_args, match_buffer,
             compact_staging, chunk, match_cap })
@@ -573,9 +855,13 @@ impl GpuSearch {
             plant_count: count_plants, cutoff,
             post_112: u32::from(post_112),
             prune: match loop_mode { GpuLoop::Full => 0, GpuLoop::Prune => 1,
-                GpuLoop::Grouped => 2, GpuLoop::TwoStage => 1 },
+                GpuLoop::Grouped => 2, GpuLoop::TwoStage => 1,
+                GpuLoop::Lut => 1 },
             group_size, stage1_count, compact: u32::from(output_mode == GpuOutput::Compact),
             match_cap: self.match_cap,
+            tile_base:0, tiles_per_row:0, y_tiles:0, halo_x_min:0,
+            halo_x_size:0, halo_z_min:0, halo_z_size:0, halo_y_min:0,
+            halo_y_size:0, cache_words:0, reserved0:0, reserved1:0,
         };
         self.queue.write_buffer(&self.params_buffer, 0, bytemuck::bytes_of(&params));
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -614,8 +900,13 @@ impl GpuSearch {
             let mut compute = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("grass single-dispatch pass"), timestamp_writes: None,
             });
-            compute.set_pipeline(&self.pipeline);
-            compute.set_bind_group(0, &self.bind_group, &[]);
+            if loop_mode == GpuLoop::Lut {
+                compute.set_pipeline(&self.lut_pipeline);
+                compute.set_bind_group(0, &self.experimental_bind_group, &[]);
+            } else {
+                compute.set_pipeline(&self.pipeline);
+                compute.set_bind_group(0, &self.bind_group, &[]);
+            }
             compute.dispatch_workgroups(n.div_ceil(WORKGROUP), 1, 1);
         }
         let (buffer,bytes) = if output_mode == GpuOutput::Compact {
@@ -716,7 +1007,12 @@ fn main() -> Result<()> {
         }
     } else { None };
     eprintln!("Mode: {}", if gpu.is_some() {"GPU"} else {"CPU (Rayon)"});
-    if gpu.is_none() { eprintln!("CPU loop: {:?} | Rayon workers: {}", opt.cpu_loop, rayon::current_num_threads()); }
+    if gpu.is_none() { eprintln!("CPU loop: {:?} | Rayon workers: {} | error: {:?}",
+        opt.cpu_loop, rayon::current_num_threads(), opt.cpu_error); }
+    let error_tables = if gpu.is_none() { make_error_tables(&plants) } else { Vec::new() };
+    if gpu.is_none() && opt.cpu_loop == CpuLoop::Tiled {
+        return run_cpu_tiles(grid, &opt, &plants, &error_tables, cutoff, origin);
+    }
     if gpu.is_some() { eprintln!("GPU loop: {:?} | output: {:?} | group-size: {} | first-stage plants: {} | match-cap: {}",
         opt.gpu_loop, opt.gpu_output, opt.group_size, opt.stage1_plants, opt.match_cap); }
     let mut processed: u64 = 0;
@@ -781,7 +1077,8 @@ fn main() -> Result<()> {
                     (sum != FAIL).then_some((local, sum))
                 }).collect()
             } else {
-                scan_cpu_columns(grid, processed, n, &plants, cutoff, opt.post_112, opt.cpu_loop)
+                scan_cpu_columns(grid, processed, n, &plants, cutoff, opt.post_112, opt.cpu_loop,
+                    (opt.cpu_error == CpuError::Lut).then_some(error_tables.as_slice()))
             };
             matched += matches.len() as u64;
             if opt.print_matches {
@@ -833,8 +1130,10 @@ mod tests {
     fn optimized_defaults() {
         let defaults = Options::default();
         assert_eq!(defaults.backend, Backend::Auto);
-        assert_eq!(defaults.cpu_loop, CpuLoop::Grouped);
-        assert_eq!(defaults.gpu_loop, GpuLoop::Prune);
+        assert_eq!(defaults.cpu_loop, CpuLoop::Tiled);
+        assert_eq!(defaults.cpu_error, CpuError::Lut);
+        assert_eq!(defaults.tile_size, 128);
+        assert_eq!(defaults.gpu_loop, GpuLoop::Lut);
         assert_eq!(defaults.gpu_output, GpuOutput::Compact);
         assert_eq!(defaults.range, 10_000);
         assert_eq!((defaults.y_min, defaults.y_max), (62, 82));
@@ -902,10 +1201,66 @@ mod tests {
                 }).collect();
                 expected.sort_unstable();
                 for strategy in [CpuLoop::Column, CpuLoop::Grouped, CpuLoop::Full] {
-                    let mut actual = scan_cpu_columns(grid, processed, n, &plants, cutoff, false, strategy);
+                    let mut actual = scan_cpu_columns(grid, processed, n, &plants, cutoff, false, strategy, None);
                     actual.sort_unstable();
                     assert_eq!(actual, expected, "start {processed}, strategy {strategy:?}, cutoff {cutoff}");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_lut_and_tile_equal_direct_reference_including_partial_tiles() {
+        let (_, mut plants) = load_plants("offsets.txt").unwrap();
+        rank_plants(&mut plants);
+        let tables = make_error_tables(&plants);
+        for post in [false, true] {
+            let opt = Options {range: 9, y_min:62, y_max:69, ..Default::default()};
+            let grid = Grid::new(&opt).unwrap();
+            for tile_size in [8,16] {
+                let halo = tile_halo(&plants, post, tile_size, grid.y_count).unwrap();
+                for cutoff in [1,22,55,121,496] {
+                    let mut expected = Vec::new();
+                    for index in 0..grid.total {
+                        let pos = grid.position(index);
+                        let score = eval_cpu(pos, &plants, cutoff, post);
+                        if score != FAIL { expected.push((pos.x,pos.y,pos.z,score)); }
+                    }
+                    let column_results = scan_cpu_columns(grid, 0, grid.total as u32, &plants,
+                        cutoff, post, CpuLoop::Grouped, Some(&tables));
+                    let mut column = column_results.into_iter().map(|(i,d)| {
+                        let p = grid.position(u64::from(i)); (p.x,p.y,p.z,d)
+                    }).collect::<Vec<_>>();
+                    let tiles = u64::from(grid.width.div_ceil(tile_size));
+                    let (_, tile_results) = scan_cpu_tile_batch::<false>(grid,tile_size,0,tiles*tiles,
+                        &plants,&tables,cutoff,post,halo);
+                    let (_, tile_lut_results) = scan_cpu_tile_batch::<true>(grid,tile_size,0,tiles*tiles,
+                        &plants,&tables,cutoff,post,halo);
+                    let mut a = tile_results.into_iter().map(|(p,d)| (p.x,p.y,p.z,d)).collect::<Vec<_>>();
+                    let mut b = tile_lut_results.into_iter().map(|(p,d)| (p.x,p.y,p.z,d)).collect::<Vec<_>>();
+                    expected.sort_unstable(); column.sort_unstable(); a.sort_unstable(); b.sort_unstable();
+                    assert_eq!(column,expected);
+                    assert_eq!(a,expected);
+                    assert_eq!(b,expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_packed_lookup_reproduces_direct_error() {
+        let (_,mut plants)=load_plants("offsets.txt").unwrap();
+        rank_plants(&mut plants);
+        let tables=make_error_tables(&plants);
+        for (p,table) in plants.iter().zip(&tables) {
+            for hash in (0..4096usize).step_by(3) {
+                let x=hash as i32 & 15;
+                let y=(hash as i32>>4)&15;
+                let z=(hash as i32>>8)&15;
+                let direct=(p.observed.x-x).abs()+(p.observed.y-y).abs()+(p.observed.z-z).abs();
+                let word=u32::from_le_bytes(table[(hash/4)*4..(hash/4)*4+4].try_into().unwrap());
+                let lookup=(word>>((hash%4)*8))&255;
+                assert_eq!(lookup,direct as u32);
             }
         }
     }

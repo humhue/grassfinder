@@ -1,22 +1,30 @@
 # How grassfinder works
 
-## The input
+## Input and matching
 
-A Minecraft grass plant's displacement is determined by a coordinate hash. From a screenshot, reconstruct the relative block coordinates of several plants and their visual offsets, then search for the world position whose calculated offsets fit best. See [polymetric's original program](https://github.com/polymetric/grassfinder) for the foundation of this technique.
+Grassfinder searches for the world coordinates corresponding to plant offsets reconstructed from Minecraft screenshots. It is based on [polymetric's original program](https://github.com/polymetric/grassfinder).
 
-Each nonempty line in `offsets.txt` contains six integers:
+Each line of `offsets.txt` specifies six integers:
 
 ```text
 observed_x observed_y observed_z offset_x offset_y offset_z
 ```
 
-Offsets are in `0..15`. The first position is an *observed origin*. Other positions are treated as relative to it; search results give the corresponding world coordinate and translation. Lines beginning with `#` (or trailing comments) are allowed.
+Offsets range from 0 to 15. The first plant defines the observed coordinate origin; subsequent plant coordinates and search results are interpreted relative to it. Blank lines and `#` comments are supported.
 
-For screenshots from **Minecraft 1.8 onward**, use `--post-1.8`: the grass hash does not depend on world Y, so only X and Z can be recovered by this technique. In older versions, the three-dimensional hash includes Y. The older `--post-1.12` spelling remains accepted as an alias.
+For screenshots from Minecraft 1.8 onward use `--post-1.8` (old alias `--post-1.12`). In that mode the relevant grass hash is independent of world Y, so it cannot recover Y.
 
-## Hash and error metric
+For each candidate world position and plant, Grassfinder predicts the three 4-bit offsets and sums absolute differences. A match satisfies:
 
-The coordinate-mixing function is equivalent, for grass offsets, to:
+```text
+sum of absolute differences < average_delta * plant_count
+```
+
+The inequality is strict. The default average delta is 5; increasing it admits more inaccurate observations and false matches.
+
+## Grass hash: 32-bit equivalence
+
+The required hash bits are 16–27. Wrapping 32-bit arithmetic preserves these bits even though the original used 64-bit values:
 
 ```rust
 let seed = (x as u32).wrapping_mul(3129871)
@@ -27,87 +35,66 @@ let hash = seed.wrapping_mul(seed).wrapping_mul(42317861)
 let offsets = [(hash >> 16) & 15, (hash >> 20) & 15, (hash >> 24) & 15];
 ```
 
-These are the same bits used by the original 64-bit arithmetic: only bits 16–27 matter, so wrapping 32-bit operations produce identical relevant results. The implementation evaluates the sum of absolute differences across all three offset components for each observed plant.
+The test suite compares this result with the original wrapping 64-bit calculation.
 
-A candidate matches when:
+## CPU default: tiled + LUT
 
-```text
-sum of all component differences < maximum average delta × number of plants
-```
+Rayon automatically uses available logical CPU threads unless `RAYON_NUM_THREADS` is set.
 
-An average delta of 5 is useful for imperfectly reconstructed screenshots but is not guaranteed to work for every input. A lower threshold rejects more candidates; a higher threshold allows more false positives. Additional correctly reconstructed plants usually improve discrimination.
+The CPU searches columns rather than decoding flattened indices for every candidate, and reuses horizontal X/Z portions of each plant's hash across Y levels. Plants are ordered by expected error against random offsets to improve early rejection.
 
-## CPU optimizations
+The default `--cpu-loop tiled` constructs overlapping spatial tiles of grass hashes, including a border for the plants' relative positions. Each 12-bit grass offset is stored in a `u16`, so the cache stays relatively small. Tiles are independent and cached per worker; neighboring tile borders may be recomputed. Default `--tile-size 128` used approximately 2.33 MiB per worker with the supplied offsets and 65-level Y range. Storage depends on the plant spread and search height.
 
-The CPU backend uses [Rayon](https://github.com/rayon-rs/rayon) to split the search across available logical CPU threads. By default it selects the `grouped` strategy automatically; `RAYON_NUM_THREADS` can override the worker count for benchmarking.
+The default `--cpu-error lut` uses a 4,096-entry `u8` table for each plant. Each lookup replaces three absolute differences with one indexed error byte. For 11 plants, the full set occupies 44 KiB. The tiled evaluator combines this table with the spatial hash cache and early rejection; it never changes the matching criterion.
 
-**Column-based search.** Instead of converting a flattened index back into X, Y and Z for every candidate, the CPU iterates over X/Z columns and evaluates their Y levels in sequence. For each column and grass plant, it calculates the X/Z-dependent portion of the hash seed once and reuses it at every Y level. This avoids repeated 64-bit quotient/remainder operations and two coordinate multiplications per plant per Y level. Work is still divided into batches and columns across Rayon workers.
-
-**Grouped pruning (CPU default).** The first four plants are evaluated together without a data-dependent early exit, allowing the CPU more freedom to schedule their independent arithmetic. If their accumulated error already reaches the cutoff, the candidate is rejected. Otherwise, the remaining plants are evaluated individually, with early rejection after each one. This keeps the same match criterion as a full evaluation. A plain `column` mode checks the cutoff after *every* plant; for this workload, grouped pruning measured substantially faster.
-
-**Plant ordering.** Before searching, plants are sorted once by expected absolute error against a uniformly distributed four-bit offset. Observed offsets near 0 or 15 typically differ more from random candidate offsets than values near 7 or 8, so testing them first often improves pruning. Sorting does not change which candidates match.
-
-**Available CPU strategies:**
+Other CPU modes are retained for comparisons:
 
 ```sh
-cargo run --release -- --backend cpu --cpu-loop grouped --no-matches
-cargo run --release -- --backend cpu --cpu-loop column  --no-matches
-cargo run --release -- --backend cpu --cpu-loop full    --no-matches
-cargo run --release -- --backend cpu --cpu-loop flat    --no-matches
+cargo run --release -- --backend cpu --cpu-loop grouped --cpu-error direct --no-matches
+cargo run --release -- --backend cpu --cpu-loop grouped --cpu-error lut --no-matches
+cargo run --release -- --backend cpu --cpu-loop tiled --cpu-error lut --tile-size 64 --no-matches
+cargo run --release -- --backend cpu --cpu-loop full --no-matches
+cargo run --release -- --backend cpu --cpu-loop flat --no-matches
 ```
 
-All these modes preserve the same error calculation and accepted candidates. They differ only in traversal and how much computation is skipped. Worst-case work remains `O(positions × plants)`.
+`grouped` evaluates four plants before checking the cutoff, then prunes remaining plants individually. `column` prunes after every plant, `full` evaluates all plants, and `flat` is the earlier per-position CPU baseline. Worst-case asymptotic work remains O(positions × plants).
 
-## GPU execution
+## GPU default: LUT + compact output
 
-The GPU kernel maps batches of positions into 32-bit coordinates and computes their hashes independently. On macOS, wgpu uses Metal; supported Windows/Linux adapters use DirectX or Vulkan. The default `prune` mode breaks out early for rejected positions.
+The default `--gpu-loop lut` runs one independent GPU work item per candidate, using the packed per-plant error tables and early rejection. It is the fastest measured GPU method on the test M2 Pro. Other available modes are `prune`, `full`, `grouped`, and `two-stage`.
 
-The default `compact` output uses an atomic counter to write *only matches* into a bounded per-batch buffer. This avoids transferring four bytes for every searched position (32 GB over an eight-billion-position search). If too many matches fill a batch's compact buffer, the program reruns that batch with full-output readback so no results are dropped. The reported throughput includes this work.
+With `--gpu-output compact` (the default), only matching candidates are written into a bounded result buffer and read back by the CPU. If that buffer overflows, the affected batch is rerun in full-output mode to avoid losing matches. This is essential for high throughput when most candidate positions fail the test.
 
-Alternative modes are retained for investigation:
+GPU spatial tiling and simultaneous hybrid CPU/GPU scheduling were explored but excluded from this release because neither outperformed GPU LUT alone in the tested environment. Discrete NVIDIA GPUs may have different performance characteristics.
 
-```sh
-cargo run --release -- --gpu-loop full      --gpu-output compact --no-matches
-cargo run --release -- --gpu-loop grouped   --group-size 4 --no-matches
-cargo run --release -- --gpu-loop two-stage --stage1-plants 4 --no-matches
-cargo run --release -- --backend cpu --no-matches
-./benchmark.sh --range 1000 --y-min 62 --y-max 66 --delta 5
-```
+## Benchmark and validation
 
-The `two-stage` mode filters candidates with the first few plants, compacts intermediate survivors and processes survivors in a second dispatch. It can lose to direct pruning because of compaction and dispatch overhead.
+Reported measurements on **Apple M2 Pro**, using 11 plants, threshold 5, X/Z `[-10000,10000)`, Y `[62,127)` (26 billion positions):
 
-## Performance and reproducibility
-
-Measured on an **Apple M2 Pro** with **11 grass plants**, an **average delta threshold of 5**, and **26 billion candidate positions** (20,000 × 20,000 × 65; X/Z `[-10000, 10000)`, Y `[62, 127)`):
-
-| Implementation | Time | Throughput |
+| Implementation | Runtime | Positions/second |
 |---|---:|---:|
-| Original-style single-thread CPU | ~492 s | ~52.9 million positions/s |
-| Optimized CPU: grouped pruning, automatic Rayon (12 workers) | **24.859 s** | **1.046 billion positions/s** |
-| Metal GPU: pruning and compact output | **9.427 s** | **2.758 billion positions/s** |
+| Rayon CPU, grouped + direct | 25.312 s | 1.027 B |
+| Rayon CPU, tiled + LUT, 128 tile | **14.742 s** | **1.764 B** |
+| Metal GPU, prune + compact | 9.583 s | 2.713 B |
+| Metal GPU, LUT + compact | **8.781 s** | **2.961 B** |
+| Polymetric's single-thread CPU | ~492 s | ~52.9 M |
+| Single-thread CPU | ~125 s | ~208 M |
 
-Compared with the original-style single-thread baseline, the optimized CPU is approximately **19.8× faster** and the GPU **52.1× faster**. The GPU is **2.64× faster** than the optimized CPU for this workload.
-
-In additional single-worker tests, the CPU `flat` mode processed about **56 million positions/s**, `column` about **81 million/s**, `full` about **102 million/s**, and `grouped` about **139 million/s**.
-
-The original-style reference retains polymetric's full, unpruned per-position comparison and 64-bit grass hash, but replaces its spiral search with rectangular bounds for comparison. All figures are hardware- and input-dependent.
-
-For correctness checks:
+Correctness:
 
 ```sh
 cargo test --release
-cargo run --release -- --backend gpu --range 8 --y-min 62 --y-max 65 --file test_known_offsets.txt --verify
+cargo run --release -- --backend gpu --gpu-loop lut --gpu-output compact \
+    --range 8 --y-min 62 --y-max 65 --file test_known_offsets.txt --delta 2 --verify
 ```
 
-To reproduce the completed CPU/GPU comparisons on the sample offsets, with the long Y range explicitly enabled:
+For the long full search, use:
 
 ```sh
-cargo run --release -- --backend cpu --cpu-loop grouped --range 10000 --y-min 62 --y-max 127 --delta 5 --no-matches
-cargo run --release -- --backend gpu --gpu-loop prune --gpu-output compact --range 10000 --y-min 62 --y-max 127 --delta 5 --no-matches
+cargo run --release -- --backend cpu --y-max 127 --no-matches
+cargo run --release -- --backend gpu --y-max 127 --no-matches
 ```
 
-Rayon uses the machine's available logical processors by default; for a controlled single-worker comparison, prefix a CPU command with `RAYON_NUM_THREADS=1`. GPU code and shader logic are independent of the CPU-specific column and grouped optimizations.
+## History and credits
 
-## History, license and credits
-
-This builds on polymetric's original grass-coordinate search and manual reconstruction approach, humhue's parallelization and pruning work, and subsequent implementation/benchmarking work developed collaboratively with ChatGPT. The project retains the MIT license and original copyright notice.
+This project builds on polymetric's grass-coordinate search and humhue's parallelization and pruning work, with later optimization and benchmarking developed collaboratively with ChatGPT. It retains the original MIT license and attribution.
